@@ -132,6 +132,9 @@ public class RaceIntegrationTest {
     private void setupPlayerMove(UUID rId, String playerName, String nonce, int answer) {
         String prefix = "room:" + rId + ":player:" + playerName + ":";
         redisTemplate.opsForValue().set(prefix + "nonce", nonce);
+        String qPrefix = prefix + "q:" + nonce + ":";
+        redisTemplate.opsForValue().set(qPrefix + "answer", String.valueOf(answer));
+        redisTemplate.opsForValue().set(qPrefix + "expires_at", String.valueOf(System.currentTimeMillis() + 30000L));
         redisTemplate.opsForValue().set(prefix + "answer", String.valueOf(answer));
         redisTemplate.opsForValue().set(prefix + "expires_at", String.valueOf(System.currentTimeMillis() + 30000L));
     }

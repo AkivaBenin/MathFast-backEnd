@@ -96,6 +96,11 @@ public class MathEngineService {
         String nonce = UUID.randomUUID().toString();
         
         redisTemplate.opsForValue().set(prefix + "nonce", nonce, 35, java.util.concurrent.TimeUnit.SECONDS);
+        String qPrefix = prefix + "q:" + nonce + ":";
+        redisTemplate.opsForValue().set(qPrefix + "answer", String.valueOf(answer), 35, java.util.concurrent.TimeUnit.SECONDS);
+        redisTemplate.opsForValue().set(qPrefix + "q_time", String.valueOf(System.currentTimeMillis()), 35, java.util.concurrent.TimeUnit.SECONDS);
+        redisTemplate.opsForValue().set(qPrefix + "expires_at", String.valueOf(expiresAt), 35, java.util.concurrent.TimeUnit.SECONDS);
+        
         redisTemplate.opsForValue().set(prefix + "answer", String.valueOf(answer), 35, java.util.concurrent.TimeUnit.SECONDS);
         redisTemplate.opsForValue().set(prefix + "q_time", String.valueOf(System.currentTimeMillis()), 35, java.util.concurrent.TimeUnit.SECONDS);
         redisTemplate.opsForValue().set(prefix + "expires_at", String.valueOf(expiresAt), 35, java.util.concurrent.TimeUnit.SECONDS);

@@ -68,6 +68,14 @@ public class GameStateService {
             uMap.put("underdog", underdog);
             uMap.put("swapsRemaining", swapsRemaining);
             
+            String jPendingStr = redisTemplate.opsForValue().get(prefix + "junctionPending");
+            boolean junctionPending = "true".equalsIgnoreCase(jPendingStr);
+            uMap.put("junctionPending", junctionPending);
+            
+            String isActiveStr = (String) redisTemplate.opsForHash().get("room:" + roomId + ":player:" + nickname + ":status", "isActive");
+            boolean isActive = isActiveStr == null || Boolean.parseBoolean(isActiveStr);
+            uMap.put("isActive", isActive);
+            
             userList.add(uMap);
         }
         return userList;
@@ -85,12 +93,25 @@ public class GameStateService {
      * late-joining SSE subscriber immediately sees the correct state on connect.
      */
     public void triggerGameStart(UUID roomId, String jwtToken) {
+        Set<String> initialRoster = redisTemplate.opsForSet().members("roster:" + roomId);
+        if (initialRoster != null) {
+            for (String nickname : new java.util.ArrayList<>(initialRoster)) {
+                String isActiveStr = (String) redisTemplate.opsForHash().get("room:" + roomId + ":player:" + nickname + ":status", "isActive");
+                if ("false".equalsIgnoreCase(isActiveStr)) {
+                    leaveRoom(roomId, nickname);
+                }
+            }
+        }
+
         // Mod 7: Enforce at least one human player before starting
         Set<String> roster = redisTemplate.opsForSet().members("roster:" + roomId);
         int humanCount = roster != null ? roster.size() : 0;
         if (humanCount == 0) {
             throw new EmptyRoomException(roomId);
         }
+
+        List<Map<String, Object>> activeUsers = getRoomUsers(roomId);
+        sseStreamService.broadcastToRoom(roomId, "ROSTER_UPDATE", Map.of("users", activeUsers));
 
         // Mod 10: Persist STARTING to Redis first so late SSE joiners read correct state
         String stateKey = "room_state:" + roomId;

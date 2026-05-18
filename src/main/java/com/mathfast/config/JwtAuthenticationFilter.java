@@ -39,32 +39,37 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         // 1. Check Authorization header
         String authHeader = request.getHeader("Authorization");
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
-            token = authHeader.substring(7);
+            token = authHeader.substring(7).trim();
         }
 
         // 2. If not found in header, check cookies
         if (token == null && request.getCookies() != null) {
             for (Cookie cookie : request.getCookies()) {
-                if ("JWT".equals(cookie.getName())) {
-                    token = cookie.getValue();
+                if ("JWT".equals(cookie.getName()) && cookie.getValue() != null) {
+                    token = cookie.getValue().trim();
                     break;
                 }
             }
         }
 
-        if (token != null) {
-            try {
-                Claims claims = jwtUtil.validateTokenAndGetClaims(token);
-                String role = claims.get("role", String.class);
-                if (role != null) {
-                    SimpleGrantedAuthority authority = new SimpleGrantedAuthority("ROLE_" + role.toUpperCase());
-                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                            claims.getSubject(), null, Collections.singletonList(authority));
-                    SecurityContextHolder.getContext().setAuthentication(authToken);
-                }
-            } catch (Exception ex) {
-                SecurityContextHolder.clearContext();
+        if (token == null || token.isEmpty() || "null".equalsIgnoreCase(token) || "undefined".equalsIgnoreCase(token) || token.split("\\.").length != 3) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        try {
+            Claims claims = jwtUtil.validateTokenAndGetClaims(token);
+            String role = claims.get("role", String.class);
+            if (role != null) {
+                SimpleGrantedAuthority authority = new SimpleGrantedAuthority("ROLE_" + role.toUpperCase());
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                        claims.getSubject(), null, Collections.singletonList(authority));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
             }
+        } catch (Exception ex) {
+            SecurityContextHolder.clearContext();
+            filterChain.doFilter(request, response);
+            return;
         }
 
         // Intercept room creation and reset and enforce ROLE_TEACHER

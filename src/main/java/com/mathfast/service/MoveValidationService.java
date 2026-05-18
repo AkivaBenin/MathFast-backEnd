@@ -92,6 +92,14 @@ public class MoveValidationService {
             uMap.put("underdog", underdog);
             uMap.put("swapsRemaining", swapsRemaining);
             
+            String jPendingStr = redisTemplate.opsForValue().get(prefix + "junctionPending");
+            boolean junctionPending = "true".equalsIgnoreCase(jPendingStr);
+            uMap.put("junctionPending", junctionPending);
+            
+            String isActiveStr = (String) redisTemplate.opsForHash().get("room:" + raceId + ":player:" + nickname + ":status", "isActive");
+            boolean isActive = isActiveStr == null || Boolean.parseBoolean(isActiveStr);
+            uMap.put("isActive", isActive);
+            
             userList.add(uMap);
         }
         return userList;
@@ -99,7 +107,6 @@ public class MoveValidationService {
 
     @Transactional
     public ValidationResult validateAndScoreMove(UUID raceId, String playerName, String nonce, int submittedAnswer, String pathDifficulty) {
-        // Absolute Lockout: Drop all subsequent movement packets instantly upon state termination
         if ("FINISHED".equals(redisTemplate.opsForValue().get("room_state:" + raceId)) ||
             Boolean.TRUE.equals(redisTemplate.hasKey("race:" + raceId + ":terminated_lock"))) {
             return new ValidationResult(false, null, false, "FINISHED", null);
@@ -107,19 +114,33 @@ public class MoveValidationService {
 
         String prefix = "room:" + raceId + ":player:" + playerName + ":";
         String lockKey = prefix + "lock";
-        Boolean locked = redisTemplate.opsForValue().setIfAbsent(lockKey, "LOCKED", 2, TimeUnit.SECONDS);
+        Boolean locked = redisTemplate.opsForValue().setIfAbsent(lockKey, "LOCKED", 3, TimeUnit.SECONDS);
         
         if (Boolean.FALSE.equals(locked)) {
             throw new IllegalStateException("Concurrent submission blocked");
         }
 
         try {
-            // Check question expiration timer threshold
-            String expStr = redisTemplate.opsForValue().get(prefix + "expires_at");
-            if (expStr != null) {
-                long expTime = Long.parseLong(expStr);
+            String qPrefix = prefix + "q:" + nonce + ":";
+            String cachedAnswer = redisTemplate.opsForValue().get(qPrefix + "answer");
+            String qExpStr = redisTemplate.opsForValue().get(qPrefix + "expires_at");
+            String qTimeStr = redisTemplate.opsForValue().get(qPrefix + "q_time");
+
+            if (cachedAnswer == null) {
+                cachedAnswer = redisTemplate.opsForValue().get(prefix + "answer");
+                qExpStr = redisTemplate.opsForValue().get(prefix + "expires_at");
+                qTimeStr = redisTemplate.opsForValue().get(prefix + "q_time");
+                String cachedNonce = redisTemplate.opsForValue().get(prefix + "nonce");
+                if (cachedNonce == null || !cachedNonce.equals(nonce)) {
+                    MathEngineService.QuestionDTO freshQ = mathEngineService.generateQuestion(raceId, playerName, pathDifficulty != null ? pathDifficulty : "REGULAR");
+                    Double currScore = redisTemplate.opsForZSet().score("race_leaderboard:" + raceId, playerName);
+                    return new ValidationResult(false, freshQ, false, "INVALID_NONCE", currScore != null ? currScore : 0.0);
+                }
+            }
+
+            if (qExpStr != null) {
+                long expTime = Long.parseLong(qExpStr);
                 if (System.currentTimeMillis() > expTime) {
-                    // Expiration failure! Break active answer streaks, wipe streak multipliers, serve fresh question
                     redisTemplate.opsForValue().set(prefix + "streak", "0");
                     MathEngineService.QuestionDTO freshQ = mathEngineService.generateQuestion(raceId, playerName, pathDifficulty != null ? pathDifficulty : "REGULAR");
                     Double currScore = redisTemplate.opsForZSet().score("race_leaderboard:" + raceId, playerName);
@@ -127,19 +148,9 @@ public class MoveValidationService {
                 }
             }
 
-            String nonceKey = prefix + "nonce";
-            String cachedNonce = redisTemplate.opsForValue().get(nonceKey);
-            
-            if (cachedNonce == null || !cachedNonce.equals(nonce)) {
-                MathEngineService.QuestionDTO freshQ = mathEngineService.generateQuestion(raceId, playerName, pathDifficulty != null ? pathDifficulty : "REGULAR");
-                Double currScore = redisTemplate.opsForZSet().score("race_leaderboard:" + raceId, playerName);
-                return new ValidationResult(false, freshQ, false, "INVALID_NONCE", currScore != null ? currScore : 0.0);
-            }
-            redisTemplate.delete(nonceKey);
+            redisTemplate.delete(java.util.Arrays.asList(qPrefix + "answer", qPrefix + "expires_at", qPrefix + "q_time", prefix + "nonce"));
 
-            String cachedAnswer = redisTemplate.opsForValue().get(prefix + "answer");
-            if (cachedAnswer != null && Integer.parseInt(cachedAnswer) == submittedAnswer) {
-                // Correct answer - Increment luck points
+            if (Integer.parseInt(cachedAnswer) == submittedAnswer) {
                 String luckKey = prefix + "luck";
                 String cachedLuck = redisTemplate.opsForValue().get(luckKey);
                 int currentLuck = cachedLuck != null ? Integer.parseInt(cachedLuck) : 0;
@@ -149,18 +160,15 @@ public class MoveValidationService {
                     redisTemplate.opsForValue().set(prefix + "item", "OIL_SLICK");
                 }
 
-                int minPoints = getMinPoints(pathDifficulty);
-                int maxPoints = getMaxPoints(pathDifficulty);
-                int luckVal = new java.util.Random().nextInt(101);
-                int basePoints = minPoints + (int)((maxPoints - minPoints) * (luckVal / 100.0));
+                String safeDiff = pathDifficulty != null ? pathDifficulty.trim().toUpperCase() : "REGULAR";
+                int minPoints = getMinPoints(safeDiff);
+                int maxPoints = getMaxPoints(safeDiff);
+                int basePoints = minPoints == maxPoints ? minPoints : minPoints + (int)((maxPoints - minPoints) * (new java.util.Random().nextInt(101) / 100.0));
 
-                // Check active stall penalty multiplier
                 String stallVal = redisTemplate.opsForValue().get(prefix + "stall");
                 double stallMultiplier = stallVal != null ? Double.parseDouble(stallVal) : 1.0;
                 int earnedPoints = (int) Math.round(basePoints * stallMultiplier);
 
-                // Latency calculation & Speed Demon evaluation
-                String qTimeStr = redisTemplate.opsForValue().get(prefix + "q_time");
                 long latency = qTimeStr != null ? (System.currentTimeMillis() - Long.parseLong(qTimeStr)) : (1500L + new java.util.Random().nextInt(2000));
                 redisTemplate.opsForList().rightPush("race:" + raceId + ":human_latencies", String.valueOf(latency));
                 if (redisTemplate.opsForList().size("race:" + raceId + ":human_latencies") > 50) {
@@ -174,7 +182,6 @@ public class MoveValidationService {
                     redisTemplate.opsForValue().set("race:" + raceId + ":fastest_player", playerName);
                 }
 
-                // Highway Hero evaluation
                 if ("HIGHWAY".equalsIgnoreCase(pathDifficulty) || "HARD".equalsIgnoreCase(pathDifficulty)) {
                     Long hwCount = redisTemplate.opsForHash().increment("race:" + raceId + ":highway_counts", playerName, 1);
                     String maxHwStr = redisTemplate.opsForValue().get("race:" + raceId + ":max_highway_count");
@@ -185,30 +192,37 @@ public class MoveValidationService {
                     }
                 }
 
-                // Update score in leaderboard
+                Double oldScore = redisTemplate.opsForZSet().score("race_leaderboard:" + raceId, playerName);
+                double prevScore = oldScore != null ? oldScore : 0.0;
                 Double currentScore = redisTemplate.opsForZSet().incrementScore("race_leaderboard:" + raceId, playerName, earnedPoints);
 
-                // Check finish line threshold
                 String winScoreStr = redisTemplate.opsForValue().get("race:" + raceId + ":win_score");
                 int winScore = winScoreStr != null ? Integer.parseInt(winScoreStr) : 100;
+
+                double prevProgress = prevScore / (double) winScore;
+                double currProgress = (currentScore != null ? currentScore : prevScore) / (double) winScore;
+
+                String jFiredStr = redisTemplate.opsForValue().get(prefix + "junctionsFired");
+                int junctionsFired = jFiredStr != null ? Integer.parseInt(jFiredStr) : 0;
+
+                if (junctionsFired < 2 && ((prevProgress < 0.3 && currProgress >= 0.3) || (prevProgress < 0.6 && currProgress >= 0.6))) {
+                    redisTemplate.opsForValue().set(prefix + "junctionPending", "true");
+                    redisTemplate.opsForValue().set(prefix + "junctionsFired", String.valueOf(junctionsFired + 1));
+                }
 
                 if (currentScore != null && currentScore >= winScore) {
                     redisTemplate.opsForSet().add("race:" + raceId + ":finishers", playerName);
                 }
 
-                // Broadcast synchronized roster update including individual player scores and vehicle colors
                 List<Map<String, Object>> userList = getRoomUsers(raceId);
                 sseStreamService.broadcastToRoom(raceId, "ROSTER_UPDATE", Map.of("users", userList));
 
-                // Execute win condition evaluation
                 raceTerminationService.checkWinCondition(raceId);
 
-                // Forge fresh math question atomically
                 MathEngineService.QuestionDTO nextQuestion = mathEngineService.generateQuestion(raceId, playerName, pathDifficulty != null ? pathDifficulty : "REGULAR");
 
                 return new ValidationResult(true, nextQuestion, false, "SUCCESS", currentScore);
             } else {
-                // Mistake penalty - Atomic decrement on luck points bounded by 0 floor
                 String luckKey = prefix + "luck";
                 String cachedLuck = redisTemplate.opsForValue().get(luckKey);
                 int currentLuck = cachedLuck != null ? Integer.parseInt(cachedLuck) : 0;
@@ -286,12 +300,16 @@ public class MoveValidationService {
     }
     
     private int getMinPoints(String diff) {
-        if (diff == null) return 10;
-        return diff.equalsIgnoreCase("HIGHWAY") || diff.equalsIgnoreCase("HARD") ? 25 : diff.equalsIgnoreCase("DIRT") ? 7 : 10;
+        if (diff == null || diff.trim().isEmpty()) return 10;
+        String d = diff.trim().toUpperCase();
+        if (d.equals("REGULAR") || d.equals("EASY")) return 10;
+        return d.equals("HIGHWAY") || d.equals("HARD") ? 25 : d.equals("DIRT") ? 7 : 10;
     }
 
     private int getMaxPoints(String diff) {
-        if (diff == null) return 12;
-        return diff.equalsIgnoreCase("HIGHWAY") || diff.equalsIgnoreCase("HARD") ? 35 : diff.equalsIgnoreCase("DIRT") ? 7 : 12;
+        if (diff == null || diff.trim().isEmpty()) return 10;
+        String d = diff.trim().toUpperCase();
+        if (d.equals("REGULAR") || d.equals("EASY")) return 10;
+        return d.equals("HIGHWAY") || d.equals("HARD") ? 35 : d.equals("DIRT") ? 7 : 10;
     }
 }

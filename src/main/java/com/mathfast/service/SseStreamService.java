@@ -22,18 +22,31 @@ public class SseStreamService {
         this.redisTemplate = redisTemplate;
     }
 
-    public SseEmitter createConnection(UUID roomId, String jwtToken) {
+    public SseEmitter createConnection(UUID roomId, String jwtToken, String playerName) {
         SseEmitter emitter = new SseEmitter(3600000L); // 1-hour timeout
 
         roomEmitters.computeIfAbsent(roomId, k -> new CopyOnWriteArrayList<>()).add(emitter);
 
-        emitter.onCompletion(() -> removeEmitter(roomId, emitter));
+        String pName = playerName != null ? playerName : "Guest";
+
+        emitter.onCompletion(() -> {
+            removeEmitter(roomId, emitter);
+            if (!"Guest".equals(pName)) {
+                redisTemplate.opsForHash().put("room:" + roomId + ":player:" + pName + ":status", "isActive", "false");
+            }
+        });
         emitter.onTimeout(() -> {
             removeEmitter(roomId, emitter);
+            if (!"Guest".equals(pName)) {
+                redisTemplate.opsForHash().put("room:" + roomId + ":player:" + pName + ":status", "isActive", "false");
+            }
             emitter.complete();
         });
         emitter.onError(e -> {
             removeEmitter(roomId, emitter);
+            if (!"Guest".equals(pName)) {
+                redisTemplate.opsForHash().put("room:" + roomId + ":player:" + pName + ":status", "isActive", "false");
+            }
             emitter.completeWithError(e);
         });
 
@@ -92,6 +105,14 @@ public class SseStreamService {
                     if (item != null) uMap.put("inventoryItem", item);
                     uMap.put("underdog", underdog);
                     uMap.put("swapsRemaining", swapsRemaining);
+                    
+                    String jPendingStr = redisTemplate.opsForValue().get(prefix + "junctionPending");
+                    boolean junctionPending = "true".equalsIgnoreCase(jPendingStr);
+                    uMap.put("junctionPending", junctionPending);
+                    
+                    String isActiveStr = (String) redisTemplate.opsForHash().get("room:" + roomId + ":player:" + nickname + ":status", "isActive");
+                    boolean isActive = isActiveStr == null || Boolean.parseBoolean(isActiveStr);
+                    uMap.put("isActive", isActive);
                     
                     userList.add(uMap);
                 }

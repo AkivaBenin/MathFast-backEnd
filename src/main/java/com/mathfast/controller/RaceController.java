@@ -33,8 +33,8 @@ public class RaceController {
     }
 
     @GetMapping(value = "/{id}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamRace(@PathVariable UUID id, @CookieValue(value = "JWT", required = false) String jwtToken) {
-        return sseStreamService.createConnection(id, jwtToken);
+    public SseEmitter streamRace(@PathVariable UUID id, @CookieValue(value = "JWT", required = false) String jwtToken, @RequestParam(required = false) String playerName) {
+        return sseStreamService.createConnection(id, jwtToken, playerName);
     }
 
     @GetMapping("/{id}/question")
@@ -58,10 +58,12 @@ public class RaceController {
         String item = payload.containsKey("item") ? String.valueOf(payload.get("item")) : "TURBO_CHARGE";
         String attacker = payload.containsKey("attacker") ? String.valueOf(payload.get("attacker")) : (payload.containsKey("playerId") ? String.valueOf(payload.get("playerId")) : "Rival Racer");
         
-        if ("OIL_SLICK".equalsIgnoreCase(item)) {
-            moveValidationService.executeSabotage(id, attacker, "Oil Slick");
-        } else {
-            sseStreamService.broadcastToRoom(id, "OVERTAKE", Map.of(
+        if ("SWAP_TOKEN".equalsIgnoreCase(item)) {
+            return ResponseEntity.ok(Map.of("success", true, "swap", true));
+        } else if ("TURBO_CHARGE".equalsIgnoreCase(item)) {
+            sseStreamService.broadcastToRoom(id, "ITEM_DEPLOYED", Map.of(
+                "attacker", attacker,
+                "item", item,
                 "message", "Turbo Deployed by " + attacker + "!"
             ));
         }
@@ -70,9 +72,13 @@ public class RaceController {
 
     @PostMapping("/{id}/path")
     public ResponseEntity<Map<String, Object>> updatePath(@PathVariable UUID id, @RequestBody Map<String, String> payload) {
-        String playerName = payload.getOrDefault("playerId", "Guest");
+        String playerName = payload.getOrDefault("playerId", payload.getOrDefault("nickname", "Guest"));
         String path = payload.getOrDefault("path", "REGULAR");
         redisTemplate.opsForValue().set("room:" + id + ":player:" + playerName + ":path", path);
+        redisTemplate.opsForValue().set("room:" + id + ":player:" + playerName + ":junctionPending", "false");
+        redisTemplate.delete("room:" + id + ":player:" + playerName + ":junctionPending");
+        List<Map<String, Object>> userList = moveValidationService.getRoomUsers(id);
+        sseStreamService.broadcastToRoom(id, "ROSTER_UPDATE", Map.of("users", userList));
         return ResponseEntity.ok(Map.of("success", true, "path", path));
     }
 

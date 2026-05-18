@@ -9,7 +9,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -20,11 +22,13 @@ public class RaceTerminationService {
     private final StringRedisTemplate redisTemplate;
     private final SseStreamService sseStreamService;
     private final GameHistoryRepository gameHistoryRepository;
+    private final GameStateService gameStateService;
 
-    public RaceTerminationService(StringRedisTemplate redisTemplate, SseStreamService sseStreamService, GameHistoryRepository gameHistoryRepository) {
+    public RaceTerminationService(StringRedisTemplate redisTemplate, SseStreamService sseStreamService, GameHistoryRepository gameHistoryRepository, GameStateService gameStateService) {
         this.redisTemplate = redisTemplate;
         this.sseStreamService = sseStreamService;
         this.gameHistoryRepository = gameHistoryRepository;
+        this.gameStateService = gameStateService;
     }
 
     public void checkWinCondition(UUID raceId) {
@@ -109,7 +113,6 @@ public class RaceTerminationService {
     }
     
     public void executeAdminReset(UUID raceId) {
-        // Evict all player-specific ephemeral keys (both room-scoped and legacy)
         Set<String> roster = redisTemplate.opsForSet().members("roster:" + raceId);
         if (roster != null) {
             for (String playerName : roster) {
@@ -120,23 +123,23 @@ public class RaceTerminationService {
                 redisTemplate.delete(prefix + "q_time");
                 redisTemplate.delete(prefix + "expires_at");
                 redisTemplate.delete(prefix + "streak");
-                redisTemplate.delete(prefix + "swaps");
-                redisTemplate.delete(prefix + "path");
-                redisTemplate.delete(prefix + "stall");
+                redisTemplate.delete(prefix + "item");
+                redisTemplate.delete(prefix + "underdog");
+                redisTemplate.delete(prefix + "junctionsFired");
 
-                redisTemplate.delete("player:" + playerName + ":nonce");
-                redisTemplate.delete("player:" + playerName + ":answer");
-                redisTemplate.delete("player:" + playerName + ":lock");
-                redisTemplate.delete("player:" + playerName + ":q_time");
-                redisTemplate.delete("player:" + playerName + ":swaps");
-                redisTemplate.delete("player:" + playerName + ":path");
-                redisTemplate.delete("player:" + playerName + ":stall");
+                redisTemplate.opsForValue().set(prefix + "luck", "0");
+                redisTemplate.opsForValue().set(prefix + "stall", "1.0");
+                redisTemplate.opsForValue().set(prefix + "swaps", "3");
+                redisTemplate.opsForValue().set(prefix + "path", "REGULAR");
+                redisTemplate.opsForValue().set(prefix + "junctionPending", "false");
+                redisTemplate.opsForHash().put("room:" + raceId + ":player:" + playerName + ":status", "isActive", "true");
+
+                redisTemplate.opsForZSet().add("race_leaderboard:" + raceId, playerName, 0.0);
             }
         }
 
         String[] keys = new String[]{
             "room_state:" + raceId,
-            "race_leaderboard:" + raceId,
             "race:" + raceId + ":finishers",
             "race:" + raceId + ":human_latencies",
             "race:" + raceId + ":fastest_time",
@@ -144,27 +147,24 @@ public class RaceTerminationService {
             "race:" + raceId + ":highway_counts",
             "race:" + raceId + ":max_highway_count",
             "race:" + raceId + ":highway_hero",
-            "race:" + raceId + ":terminated_lock",
-            "race:" + raceId + ":win_score"
+            "race:" + raceId + ":terminated_lock"
         };
         for (String k : keys) {
             redisTemplate.delete(k);
         }
 
-        // Re-seed leaderboard with 0 for all existing roster members
-        if (roster != null && !roster.isEmpty()) {
-            for (String playerName : roster) {
-                redisTemplate.opsForZSet().add("race_leaderboard:" + raceId, playerName, 0.0);
-            }
-        }
+        // Explicitly zero out winScore
+        redisTemplate.opsForValue().set("race:" + raceId + ":win_score", "0");
 
+        redisTemplate.opsForValue().set("room:" + raceId, "LOBBY");
         redisTemplate.opsForValue().set("room_state:" + raceId, "LOBBY");
         sseStreamService.broadcastToRoom(raceId, "ROOM_RESET", "LOBBY");
         sseStreamService.broadcastToRoom(raceId, "STATE_CHANGE", "LOBBY");
+        List<Map<String, Object>> userList = gameStateService.getRoomUsers(raceId);
+        sseStreamService.broadcastToRoom(raceId, "ROSTER_UPDATE", Map.of("users", userList));
     }
 
     public void executeSoftLobbyReturn(UUID raceId) {
-        // Clear ephemeral race progress metrics while keeping roster and participant registries fully intact
         String[] keys = new String[]{
             "race:" + raceId + ":finishers",
             "race:" + raceId + ":terminated_lock",
@@ -178,7 +178,8 @@ public class RaceTerminationService {
             redisTemplate.delete(k);
         }
 
-        // Reset scores in leaderboard to 0 for all existing roster members
+        redisTemplate.opsForValue().set("race:" + raceId + ":win_score", "0");
+
         Set<String> roster = redisTemplate.opsForSet().members("roster:" + raceId);
         if (roster != null && !roster.isEmpty()) {
             for (String playerName : roster) {
@@ -191,6 +192,7 @@ public class RaceTerminationService {
             }
         }
 
+        redisTemplate.opsForValue().set("room:" + raceId, "LOBBY");
         redisTemplate.opsForValue().set("room_state:" + raceId, "LOBBY");
         sseStreamService.broadcastToRoom(raceId, "STATE_CHANGE", "LOBBY");
     }
